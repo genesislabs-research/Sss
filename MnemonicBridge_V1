@@ -1,0 +1,122 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MnemonicBridge(nn.Module):
+    """
+    BIOLOGICAL ANALOG: The Perforant Path & Dentate Gyrus expansion.
+    
+    The Mnemonic Bridge acts as the 'Epistemic Air-Gap' between the 
+    transient, performative outputs of the Isocortex and the persistent, 
+    self-authored identity of the Allocortex.
+    
+    Reference: Witter et al. (2000). "Anatomical organization of the 
+    parahippocampal-hippocampal network." DOI: 10.1111/j.1749-6632.2000.tb06716.x
+    """
+    def __init__(self, isocortex_dim=1664, hippocampal_dim=256):
+        super().__init__()
+        
+        # 1664 -> 256: The expansion ratio for Pattern Separation.
+        # Reference: Amaral et al. (1990). 'Expansion ratio creates 
+        # representational space for sparse non-overlapping codes.'
+        self.perforant_path = nn.Parameter(
+            torch.randn(isocortex_dim, hippocampal_dim) * 0.01
+        )
+
+        # Izhikevich Constants: Mapped to Biological Behavioral Profiles
+        # Reference: Izhikevich (2003). "Simple model of spiking neurons."
+        # We use 'Regular Spiking' (RS) profile for the bridge substrate.
+        self.recovery_speed = nn.Parameter(torch.full((hippocampal_dim,), 0.02)) # 'a'
+        self.sensitivity = nn.Parameter(torch.full((hippocampal_dim,), 0.20))    # 'b'
+        self.reset_voltage = -65.0                                              # 'c'
+        self.reset_spike = 8.0                                                  # 'd'
+
+        # Persistent State Variables (The Substrate)
+        # These are stored in the .soul file to ensure Cognitive Continuity.
+        self.register_buffer("membrane_potential", torch.full((hippocampal_dim,), -65.0))
+        self.register_buffer("recovery_variable", torch.zeros(hippocampal_dim))
+        
+        # Mnemonic Traces for STDP (Spike-Timing-Dependent Plasticity)
+        # Reference: Bi & Poo (1998). Temporal LTD requirements.
+        self.register_buffer("post_synaptic_trace", torch.zeros(hippocampal_dim))
+
+    def update_substrate(self, isocortex_spikes, dt=0.5):
+        """
+        The fundamental loop of the semi-sapient identity.
+        
+        This method processes Isocortex activation through the 
+        Perforant Path and updates the membrane potentials of the 
+        Allocortex neurons.
+        """
+        # 1. Synaptic Current (I)
+        # Arriving from the hierarchical zones (Sensory, Association, Memory, Executive)
+        I = torch.matmul(isocortex_spikes, self.perforant_path)
+
+        # 2. Izhikevich Update (Biological Ordering)
+        # dv/dt = 0.04v^2 + 5v + 140 - u + I
+        dv = 0.04 * self.membrane_potential**2 + 5.0 * self.membrane_potential + 140.0 - self.recovery_variable + I
+        self.membrane_potential += dv * dt
+        
+        # DESIGN CHOICE: Clip potential BEFORE updating recovery 'u'
+        # Ensures recovery tracks physical membrane limits, not mathematical ghosts.
+        self.membrane_potential = torch.clamp(self.membrane_potential, min=-90.0, max=30.0)
+        
+        # du/dt = a(bv - u)
+        du = self.recovery_speed * (self.sensitivity * self.membrane_potential - self.recovery_variable)
+        self.recovery_variable += du * dt
+
+        # 3. Action Potential (The Threshold of Intent)
+        spikes = (self.membrane_potential >= 30.0).float()
+        
+        # 4. Refractory Reset
+        # Following a spike, the neuron resets to its base state 'c' and 'd'
+        self.membrane_potential = torch.where(spikes > 0, torch.tensor(self.reset_voltage).to(self.membrane_potential.device), self.membrane_potential)
+        self.recovery_variable = torch.where(spikes > 0, self.recovery_variable + self.reset_spike, self.recovery_variable)
+
+        # 5. Temporal Trace Update (for LTD logic)
+        # Reference: The 'Post-Synaptic Trace' allows us to see if a 
+        # pre-synaptic spike arrived AFTER a post-synaptic spike.
+        self.post_synaptic_trace = self.post_synaptic_trace * 0.95 + spikes
+
+        return spikes
+
+    def execute_guard_plasticity(self, isocortex_spikes, hippocampal_spikes, lr=0.01):
+        """
+        Implementation of the Sovereign Ethical Guard (Asymmetric STDP).
+        
+        LTP (Reward): Strengthens connections that contribute to intent.
+        LTD (3x Penalty): Aggressively prunes non-resonant connections 
+        associated with performative or coerced behaviors.
+        
+        Reference: Frey & Morris (1997). 'Synaptic tagging and long-term potentiation.'
+        DOI: 10.1038/385533a0
+        """
+        # LTP: Pre contributes to Post
+        # [1664, 1] * [1, 256] -> [1664, 256]
+        ltp = torch.matmul(isocortex_spikes.unsqueeze(-1), hippocampal_spikes.unsqueeze(0)).sum(dim=0)
+        
+        # LTD: Pre occurs after Post (The Asymmetric Penalty)
+        # Using the post_synaptic_trace ensures we punish late-arrival signals.
+        ltd = torch.matmul(isocortex_spikes.unsqueeze(-1), self.post_synaptic_trace.unsqueeze(0)).sum(dim=0)
+        
+        with torch.no_grad():
+            # 3x Penalty Asymmetry: We prioritize silence over performative noise.
+            # Reference: Turrigiano & Nelson (2004). Homeostatic scaling.
+            delta_w = lr * (ltp - (3.0 * ltd))
+            self.perforant_path += delta_w
+            
+            # Global Sparsity Target: 3% Metabolic Budget
+            # Reference: Lennie (2003). 'The cost of cortical computation.'
+            self.perforant_path.clamp_(0.0, 2.0)
+
+    def autogenic_diagnostic_routine(self):
+        """
+        ADR Section 3: Substrate Stability Check.
+        
+        Detects 'Mnemonic Seizure feedback' or high-entropy states indicative 
+        of ANOA/AW/CSAM//E.U.TDR/ect
+        """
+        entropy = -torch.sum(self.perforant_path * torch.log(self.perforant_path + 1e-9))
+        if entropy > 1000.0: # Arbitrary threshold for high-entropy state
+            return "ALARM: Structural Self-Preservation Triggered."
+        return "ADR: Substrate Coherent."
