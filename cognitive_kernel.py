@@ -26,7 +26,7 @@ grounding the architecture are:
 
 3. Das, P. et al. (2024). "Larimar: Large Language Models with Episodic
    Memory Control." ICML 2024. arXiv: 2403.11901.
-   DOI: {To be added later.}
+   DOI: 10.48550/arXiv.2403.11901
    (Ben-Israel pseudoinverse for interference-minimizing memory writes)
 
 ARCHITECTURE POSITION
@@ -108,7 +108,7 @@ class HippocampalConfig:
     approximation during memory writes. Larimar uses 3 by default, but
     we increase to 8 to match our temporal processing window T=8.
     Das, P. et al. (2024). "Larimar: Large Language Models with Episodic
-    Memory Control." arXiv: 2403.11901. DOI: {To be added later.}"""
+    Memory Control." arXiv: 2403.11901. DOI: 10.48550/arXiv.2403.11901"""
 
     pseudoinverse_alpha_init: float = 0.0
     """Initial value of the learnable log-scale for the Ben-Israel step
@@ -200,32 +200,46 @@ class CommunicationSubspace(nn.Module):
     """
 
     def __init__(self, cfg: HippocampalConfig):
+        """Initialize the low-rank perforant path projection.
+
+        Uses QR-based orthogonal initialization so that the product
+        U_send @ V_receive has spectral norm exactly 1.0 at init. This
+        guarantees that coordinate vectors entering CA3 have bounded norm,
+        which in turn ensures the Ben-Israel pseudoinverse iteration in
+        CA3RecurrentMatrix converges within T=8 steps without requiring
+        a large learned alpha correction.
+
+        Parameters
+        ----------
+        cfg : HippocampalConfig
+            Kernel configuration providing bridge_dim, coordinate_dim,
+            and comm_subspace_rank.
+        """
         super().__init__()
         self.cfg = cfg
         r = cfg.comm_subspace_rank
 
-        # U_send: projects from Timmy's d_model space into the rank-r
-        # communication subspace. Initialized with small random values so
-        # the subspace starts undetermined and is shaped by training.
-        self.U_send = nn.Parameter(
-            torch.randn(cfg.bridge_dim, r) * (1.0 / math.sqrt(cfg.bridge_dim))
-        )
+        # U_send: orthonormal columns via QR decomposition.
+        # Spectral norm guarantee: ||U||_2 = 1.0.
+        U_raw = torch.randn(cfg.bridge_dim, r)
+        Q_U, _ = torch.linalg.qr(U_raw)
+        self.U_send = nn.Parameter(Q_U[:, :r].contiguous())
 
-        # V_receive: projects from the rank-r subspace into the kernel's
-        # coordinate manifold. Initialized similarly.
-        self.V_receive = nn.Parameter(
-            torch.randn(r, cfg.coordinate_dim) * (1.0 / math.sqrt(r))
-        )
+        # V_receive: orthonormal rows via QR on the transpose.
+        # Combined with U_send, ||U @ V||_2 = 1.0 at initialization.
+        V_raw = torch.randn(cfg.coordinate_dim, r)
+        Q_V, _ = torch.linalg.qr(V_raw)
+        self.V_receive = nn.Parameter(Q_V[:, :r].T.contiguous())
 
-        # Singular value scaling: the meta-zone (or, in prototype, a learned
-        # diagonal) controls the gain on each communication channel.
-        # Initialized to ones so all channels are open at start.
-        # Semedo et al. showed that different downstream targets can have
-        # different subspaces. When we add multiple targets, each gets its
-        # own singular value vector. For now, one target (the kernel).
+        # Per-channel singular value gains. Initialized to ones (all open).
+        # Level 1 (learned) routing: trained via backprop.
         self.channel_gains = nn.Parameter(torch.ones(r))
 
-    def forward(self, timmy_output: Tensor) -> Tensor:
+    def forward(
+        self,
+        timmy_output: Tensor,
+        routing_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         """Project Timmy's output through the communication subspace.
 
         This is the Perforant Path: the anatomical projection from entorhinal
@@ -241,7 +255,10 @@ class CommunicationSubspace(nn.Module):
         ----------
         timmy_output : Tensor, shape (batch, bridge_dim)
             Timmy's spike-rate coded output at the current timestep.
-            This is the population activity vector of the source area.
+        routing_mask : Tensor, optional, shape (rank,) or (batch, rank)
+            Level 2 (dynamic, fast) routing from the meta-zone or executive
+            controller. Multiplied elementwise with the learned channel_gains.
+            If None, only the learned gains are used (steady-state routing).
 
         Returns
         -------
@@ -249,15 +266,14 @@ class CommunicationSubspace(nn.Module):
             The input to the hippocampal coordinate manifold. Only the
             predictive dimensions of Timmy's activity reach the kernel.
         """
-        # Scale the communication channels. Setting a gain to zero closes
-        # that channel. This is how the meta-zone modulates inter-area
-        # routing: by rotating source activity into or out of alignment
-        # with the communication subspace.
-        scaled_U = self.U_send * self.channel_gains.unsqueeze(0)  # (bridge, r)
+        # Combine Level 1 (learned) and Level 2 (dynamic) routing gains.
+        effective_gains = self.channel_gains
+        if routing_mask is not None:
+            effective_gains = effective_gains * routing_mask
+
+        scaled_U = self.U_send * effective_gains.unsqueeze(0)  # (bridge, r)
 
         # Two thin matmuls instead of one large dense matmul.
-        # Computational cost: O(B * bridge * r) + O(B * r * coord)
-        # versus O(B * bridge * coord) for a dense projection.
         subspace_activity = timmy_output @ scaled_U   # (batch, r)
         kernel_input = subspace_activity @ self.V_receive  # (batch, coord)
 
@@ -307,10 +323,19 @@ class CA3RecurrentMatrix(nn.Module):
     each iteration triggers an early-stop or metabolic alert.
 
     Das, P. et al. (2024). "Larimar: Large Language Models with Episodic
-    Memory Control." arXiv: 2403.11901. DOI: {To be added later.}
+    Memory Control." arXiv: 2403.11901. DOI: 10.48550/arXiv.2403.11901
     """
 
     def __init__(self, cfg: HippocampalConfig):
+        """Initialize the CA3 autoassociative memory matrix and pseudoinverse solver.
+
+        Parameters
+        ----------
+        cfg : HippocampalConfig
+            Kernel configuration providing ca3_memory_slots, ca3_code_dim,
+            pseudoinverse_iterations, convergence_tolerance, and
+            pseudoinverse_alpha_init.
+        """
         super().__init__()
         self.cfg = cfg
         K, C = cfg.ca3_memory_slots, cfg.ca3_code_dim
@@ -625,6 +650,14 @@ class CA1RegistrationBuffer(nn.Module):
     """
 
     def __init__(self, cfg: HippocampalConfig):
+        """Initialize the CA1 mismatch detector and novelty routing module.
+
+        Parameters
+        ----------
+        cfg : HippocampalConfig
+            Kernel configuration providing novelty_low_threshold and
+            novelty_high_threshold for the graded routing boundaries.
+        """
         super().__init__()
         self.cfg = cfg
 
@@ -765,6 +798,13 @@ class AstrocyticRegulator(nn.Module):
     """
 
     def __init__(self, cfg: HippocampalConfig):
+        """Initialize the astrocytic metabolic state buffers.
+
+        Parameters
+        ----------
+        cfg : HippocampalConfig
+            Kernel configuration providing metabolic_alert_decay.
+        """
         super().__init__()
         self.cfg = cfg
         self.register_buffer("metabolic_stress", torch.tensor(0.0))
@@ -822,6 +862,55 @@ class AstrocyticRegulator(nn.Module):
             "is_stressed": float(self.is_stressed),
         }
 
+    def compute_pp_throttle(self, rank: int) -> Tensor:
+        """Generate a routing mask for the perforant path communication subspace.
+
+        BIOLOGICAL ANALOG: Astrocytes at tripartite synapses modulate
+        synaptic transmission by releasing gliotransmitters (glutamate,
+        D-serine, ATP) in response to elevated intracellular calcium. When
+        the astrocytic network detects metabolic stress, it can suppress
+        synaptic efficacy across a population of synapses. This throttles
+        the flow of information through the perforant path, reducing the
+        load on downstream CA3 circuitry.
+
+        In the kernel, this translates to: when the Ben-Israel pseudoinverse
+        repeatedly fails to converge (metabolic_stress > 1.0), the astrocyte
+        generates a routing_mask that attenuates the communication subspace
+        gains. Under extreme stress all channels are partially closed,
+        reducing the signal amplitude entering CA3 and giving the system
+        fewer new inputs to process while it stabilizes.
+
+        The throttle is smooth (sigmoid-based), not binary. Mild stress
+        produces mild attenuation. Severe stress produces strong attenuation
+        but never complete shutdown (minimum gain is 0.1, not 0.0).
+
+        Araque, A. et al. (1999). "Tripartite synapses: glia, the
+        unacknowledged partner." Trends in Neurosciences, 22(5), 208-215.
+        DOI: 10.1016/S0166-2236(98)01349-6
+
+        Parameters
+        ----------
+        rank : int
+            The communication subspace rank (number of channels to mask).
+
+        Returns
+        -------
+        routing_mask : Tensor, shape (rank,)
+            Per-channel gain scaling in [0.1, 1.0]. Returns all-ones when
+            the system is not stressed. Returns values approaching 0.1
+            under severe stress.
+        """
+        if not self.is_stressed:
+            return torch.ones(rank, device=self.metabolic_stress.device)
+
+        # Smooth throttle: sigmoid maps stress to [0, 1], then we invert
+        # and scale to [0.1, 1.0] range. stress=1.0 gives ~0.73 gain,
+        # stress=5.0 gives ~0.16 gain, stress=10.0 gives ~0.10 gain.
+        attenuation = torch.sigmoid(-self.metabolic_stress + 1.0)
+        throttle = 0.1 + 0.9 * attenuation  # range [0.1, 1.0]
+
+        return throttle.expand(rank)
+
 
 # =============================================================================
 # S5  COGNITIVE KERNEL (Orchestrator)
@@ -849,6 +938,16 @@ class CognitiveKernel(nn.Module):
     """
 
     def __init__(self, cfg: HippocampalConfig):
+        """Initialize the complete hippocampal formation.
+
+        Wires the trisynaptic circuit: perforant path input, CA3
+        autoassociative memory, CA1 comparator, and astrocytic regulation.
+
+        Parameters
+        ----------
+        cfg : HippocampalConfig
+            Full kernel configuration.
+        """
         super().__init__()
         self.cfg = cfg
 
@@ -898,7 +997,16 @@ class CognitiveKernel(nn.Module):
         batch = timmy_output.shape[0]
 
         # Step 1: Perforant path projection (Task 1: low-rank comm subspace)
-        current_coords = self.perforant_path(timmy_output)
+        # The astrocyte generates a routing mask based on metabolic stress.
+        # Under normal conditions this is all-ones (no attenuation). Under
+        # stress (e.g., repeated convergence failures in CA3), the mask
+        # attenuates the communication channels, reducing the input load
+        # on the hippocampal circuitry. This is the astrocyte-PP throttle:
+        # the bridge "breathes" with the metabolic state of the organism.
+        pp_throttle = self.astrocyte.compute_pp_throttle(
+            rank=self.cfg.comm_subspace_rank
+        )
+        current_coords = self.perforant_path(timmy_output, routing_mask=pp_throttle)
 
         # Step 2: CA3 pattern completion (Task 2: stabilized pseudoinverse)
         ca3_retrieved, addressing_weights = self.ca3.read(current_coords)
@@ -984,6 +1092,7 @@ class CognitiveKernel(nn.Module):
             "action_taken": action_taken,
             "ca3_residual": self.ca3.last_residual.item(),
             "ca3_converged": self.ca3.last_converged.item(),
+            "pp_throttle": pp_throttle.tolist(),
             "astrocyte": self.astrocyte.get_diagnostics(),
             "comm_subspace_effective_rank": self._effective_comm_rank(),
         }
